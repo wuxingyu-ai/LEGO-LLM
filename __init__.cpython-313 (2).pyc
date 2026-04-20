@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+
+import os
+import sys
+
+if __name__ == "__main__" and (__package__ is None or __package__ == ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    __package__ = "moea_llm_merge"
+
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.optimize import minimize
+from pymoo.termination import get_termination
+
+from .assembly import load_source_models
+from .config import args_parse, set_seed
+from .eval_utils import save_final_outputs
+from .logging_utils import log_event, maybe_log, setup_csv_logger
+from .search import (
+    VerticalSearchProblem,
+    decode_vertical,
+    ensure_2d_array,
+    initialize_vertical_population,
+    population_from_list,
+)
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2")
+
+
+def main():
+    args = args_parse()
+    set_seed(args.seed)
+    setup_csv_logger(args)
+
+    try:
+        maybe_log(
+            args,
+            f"[Main] outer_pop={args.population_size}, outer_gen={args.generations}, "
+            f"inner_pop={args.inner_population_size}, inner_gen={args.inner_generations}",
+        )
+        maybe_log(args, f"[Main] CSV log path: {args.csv_log_path}")
+
+        log_event(
+            args,
+            stage="main",
+            event="start",
+            note=(
+                f"outer_pop={args.population_size}, outer_gen={args.generations}, "
+                f"inner_pop={args.inner_population_size}, inner_gen={args.inner_generations}"
+            ),
+        )
+
+        source_models, tokenizer = load_source_models(args.model_paths, args.dtype)
+
+        outer_problem = VerticalSearchProblem(source_models, tokenizer, args)
+
+        initial_population = population_from_list(
+            initialize_vertical_population(source_models, args)
+        )
+
+        algorithm = NSGA2(
+            pop_size=args.population_size,
+            eliminate_duplicates=True,
+        )
+
+        result = minimize(
+            outer_problem,
+            algorithm,
+            get_termination("n_gen", args.generations),
+            x0=initial_population,
+            verbose=not args.quiet,
+            seed=args.seed,
+        )
+
+        result_F = ensure_2d_array(result.F)
+        result_X = ensure_2d_array(result.X)
+        best_idx = int(result_F[:, 0].argmin())
+
+        best_vertical = decode_vertical(result_X[best_idx], source_models, args.new_model_layers)
+        _, best_chromosome = outer_problem._search_horizontal(best_vertical, outer_gen="final")
+
+        save_final_outputs(best_chromosome, source_models, tokenizer, args)
+
+        log_event(
+            args,
+            stage="main",
+            event="end",
+            beta=f"{best_chromosome.beta:.6f}",
+            num_layers=len(best_chromosome.vertical),
+            note=f"best model saved to {args.save_path}",
+        )
+
+        maybe_log(args, f"Best chromosome saved to: {args.save_path}")
+    finally:
+        logger = getattr(args, "csv_logger", None)
+        if logger is not None:
+            logger.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+import random
+from typing import Dict, Sequence
+
+import numpy as np
+import torch.nn as nn
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.core.population import Population
+from pymoo.core.problem import ElementwiseProblem
+from pymoo.optimize import minimize
+from pymoo.termination import get_termination
+
+from .assembly import (
+    Chromosome,
+    LayerAssemblyOperator,
+    LayerGene,
+    ParticipantSpec,
+    extract_decoder_layers,
+)
+from .eval_utils import evaluate_chromosome
+from .logging_utils import log_event, maybe_log
+
+
+def ensure_2d_array(x):
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        return arr.reshape(1, 1)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    return arr
+
+
+def get_beta_from_index(index: int, num_candidates: int) -> float:
+    if num_candidates <= 1:
+        return 0.5
+    values = np.linspace(0.0, 1.0, num_candidates)
+    return float(values[int(np.clip(index, 0, num_candidates - 1))])
+
+
+def initialize_vertical_population(source_models: Sequence[nn.Module], args) -> list[list[int]]:
+    population: list[list[int]] = []
+
+    for model_idx, model in enumerate(source_models):
+        layers = extract_decoder_layers(model)
+        chromosome = []
+        for depth in range(args.new_model_layers):
+            chromosome.extend([model_idx, min(depth, len(layers) - 1)])
+        population.append(chromosome)
+
+    while len(population) < args.population_size:
+        chromosome = []
+        for _ in range(args.new_model_layers):
+            model_idx = random.randint(0, len(source_models) - 1)
+            max_layer_idx = len(extract_decoder_layers(source_models[model_idx])) - 1
+            chromosome.extend([model_idx, random.randint(0, max_layer_idx)])
+        population.append(chromosome)
+
+    return population[: args.population_size]
+
+
+def initialize_horizontal_population(
+    vertical_specs: Sequence[ParticipantSpec],
+    source_models: Sequence[nn.Module],
+    args,
+) -> list[list[int]]:
+    population: list[list[int]] = []
+
+    substitute_id = list(LayerAssemblyOperator).index(LayerAssemblyOperator.SUBSTITUTE)
+    merge_id = list(LayerAssemblyOperator).index(LayerAssemblyOperator.MERGE)
+
+    baseline_sub = []
+    for _ in vertical_specs:
+        baseline_sub.extend([0, 0, 0, substitute_id])
+    baseline_sub.append(args.beta_candidates // 2)
+    population.append(baseline_sub)
+
+    baseline_merge = []
+    for primary in vertical_specs:
+        baseline_merge.extend([1, primary.model_idx, primary.layer_idx, merge_id])
+    baseline_merge.append(args.beta_candidates // 2)
+    population.append(baseline_merge)
+
+    while len(population) < args.inner_population_size:
+        chromosome = []
+        for _ in vertical_specs:
+            use_secondary = random.randint(0, 1)
+            model_idx = random.randint(0, len(source_models) - 1)
+            max_layer_idx = len(extract_decoder_layers(source_models[model_idx])) - 1
+            layer_idx = random.randint(0, max_layer_idx)
+            operator_id = random.choice(LayerAssemblyOperator.ids())
+            chromosome.extend([use_secondary, model_idx, layer_idx, operator_id])
+
+        chromosome.append(random.randint(0, max(0, args.beta_candidates - 1)))
+        population.append(chromosome)
+
+    return population[: args.inner_population_size]
+
+
+def population_from_list(individuals: Sequence[Sequence[int]]) -> Population:
+    return Population.new("X", np.asarray(individuals, dtype=int))
+
+
+def decode_vertical(
+    x: Sequence[int],
+    source_models: Sequence[nn.Module],
+    num_layers: int,
+) -> tuple[ParticipantSpec, ...]:
+    specs = []
+    for offset in range(0, num_layers * 2, 2):
+        model_idx = int(x[offset])
+        max_layer_idx = len(extract_decoder_layers(source_models[model_idx])) - 1
+        layer_idx = int(np.clip(x[offset + 1], 0, max_layer_idx))
+        specs.append(ParticipantSpec(model_idx=model_idx, layer_idx=layer_idx, active=True))
+    return tuple(specs)
+
+
+def decode_horizontal(
+    x: Sequence[int],
+    source_models: Sequence[nn.Module],
+    vertical_specs: Sequence[ParticipantSpec],
+    beta_candidates: int,
+) -> tuple[tuple[LayerGene, ...], float]:
+    genes = []
+    cursor = 0
+
+    for primary in vertical_specs:
+        use_secondary = bool(int(x[cursor]))
+        model_idx = int(x[cursor + 1]) % len(source_models)
+        max_layer_idx = len(extract_decoder_layers(source_models[model_idx])) - 1
+        layer_idx = int(np.clip(x[cursor + 2], 0, max_layer_idx))
+        operator = LayerAssemblyOperator.from_id(int(x[cursor + 3]))
+
+        secondary = (
+            ParticipantSpec(model_idx=model_idx, layer_idx=layer_idx, active=True)
+            if use_secondary
+            else None
+        )
+
+        if secondary is None:
+            operator = LayerAssemblyOperator.SUBSTITUTE
+
+        genes.append(LayerGene(primary=primary, secondary=secondary, operator=operator))
+        cursor += 4
+
+    beta_idx = int(x[cursor]) if cursor < len(x) else beta_candidates // 2
+    beta = get_beta_from_index(beta_idx, beta_candidates)
+    return tuple(genes), beta
+
+
+class HorizontalSearchProblem(ElementwiseProblem):
+    """
+    Inner problem:
+    single-objective refinement based only on performance score.
+    """
+
+    def __init__(
+        self,
+        vertical_specs: Sequence[ParticipantSpec],
+        source_models: Sequence[nn.Module],
+        tokenizer,
+        args,
+        eval_cache: Dict[Chromosome, tuple[float, float]],
+    ):
+        self.vertical_specs = tuple(vertical_specs)
+        self.source_models = source_models
+        self.tokenizer = tokenizer
+        self.args = args
+        self.eval_cache = eval_cache
+
+        n_var = len(vertical_specs) * 4 + 1
+
+        xl, xu = [], []
+        max_layers = max(len(extract_decoder_layers(m)) for m in source_models) - 1
+
+        for _ in vertical_specs:
+            xl.extend([0, 0, 0, 0])
+            xu.extend([
+                1,
+                len(source_models) - 1,
+                max_layers,
+                len(LayerAssemblyOperator) - 1,
+            ])
+
+        xl.append(0)
+        xu.append(max(0, args.beta_candidates - 1))
+
+        super().__init__(
+            n_var=n_var,
+            n_obj=1,
+            xl=np.asarray(xl),
+            xu=np.asarray(xu),
+            type_var=np.int_,
+        )
+
+    def _evaluate(self, x, out, *args, **kwargs):
+        horizontal, beta = decode_horizontal(
+            x,
+            self.source_models,
+            self.vertical_specs,
+            self.args.beta_candidates,
+        )
+        chromosome = Chromosome(
+            vertical=self.vertical_specs,
+            horizontal=horizontal,
+            beta=beta,
+        )
+
+        score, fairness = evaluate_chromosome(
+            chromosome,
+            self.source_models,
+            self.tokenizer,
+            self.args,
+            self.eval_cache,
+        )
+
+        algorithm = kwargs.get("algorithm", None)
+        inner_gen = getattr(algorithm, "n_gen", "")
+
+        maybe_log(
+            self.args,
+            f"[Inner] candidate done | score={score:.6f} | fairness={fairness:.6f}",
+        )
+
+        log_event(
+            self.args,
+            stage="inner",
+            event="candidate",
+            inner_gen=inner_gen,
+            score=f"{score:.6f}",
+            fairness=f"{fairness:.6f}",
+            beta=f"{beta:.6f}",
+            num_layers=len(self.vertical_specs),
+        )
+
+        out["F"] = np.asarray([-score], dtype=float)
+
+
+class VerticalSearchProblem(ElementwiseProblem):
+    """
+    Outer problem:
+    bi-objective optimization over:
+      1) performance
+      2) fairness
+    Inner problem only refines horizontal composition for performance.
+    """
+
+    def __init__(self, source_models: Sequence[nn.Module], tokenizer, args):
+        self.source_models = source_models
+        self.tokenizer = tokenizer
+        self.args = args
+
+        self.eval_cache: Dict[Chromosome, tuple[float, float]] = {}
+        self.inner_cache: Dict[tuple[ParticipantSpec, ...], tuple[float, Chromosome]] = {}
+
+        n_var = args.new_model_layers * 2
+        xl, xu = [], []
+        max_layers = max(len(extract_decoder_layers(m)) for m in source_models) - 1
+
+        for _ in range(args.new_model_layers):
+            xl.extend([0, 0])
+            xu.extend([len(source_models) - 1, max_layers])
+
+        super().__init__(
+            n_var=n_var,
+            n_obj=2,
+            xl=np.asarray(xl),
+            xu=np.asarray(xu),
+            type_var=np.int_,
+        )
+
+    def _search_horizontal(self, vertical_specs: tuple[ParticipantSpec, ...], outer_gen="") -> tuple[float, Chromosome]:
+        if vertical_specs in self.inner_cache:
+            maybe_log(self.args, "[Inner] cache hit.")
+            log_event(
+                self.args,
+                stage="inner_search",
+                event="cache_hit",
+                outer_gen=outer_gen,
+                num_layers=len(vertical_specs),
+            )
+            return self.inner_cache[vertical_specs]
+
+        maybe_log(
+            self.args,
+            f"[Inner] start horizontal refinement for one vertical candidate (layers={len(vertical_specs)})",
+        )
+        log_event(
+            self.args,
+            stage="inner_search",
+            event="start",
+            outer_gen=outer_gen,
+            num_layers=len(vertical_specs),
+        )
+
+        problem = HorizontalSearchProblem(
+            vertical_specs,
+            self.source_models,
+            self.tokenizer,
+            self.args,
+            self.eval_cache,
+        )
+
+        initial_population = population_from_list(
+            initialize_horizontal_population(vertical_specs, self.source_models, self.args)
+        )
+
+        algorithm = NSGA2(
+            pop_size=self.args.inner_population_size,
+            eliminate_duplicates=True,
+        )
+
+        result = minimize(
+            problem,
+            algorithm,
+            get_termination("n_gen", self.args.inner_generations),
+            x0=initial_population,
+            verbose=not self.args.quiet,
+            seed=self.args.seed,
+        )
+
+        result_F = ensure_2d_array(result.F)
+        result_X = ensure_2d_array(result.X)
+        best_idx = int(np.argmin(result_F[:, 0]))
+        best_x = result_X[best_idx]
+
+        best_horizontal, best_beta = decode_horizontal(
+            best_x,
+            self.source_models,
+            vertical_specs,
+            self.args.beta_candidates,
+        )
+        best_chromosome = Chromosome(vertical_specs, best_horizontal, best_beta)
+
+        best_score = float(-result_F[best_idx, 0])
+
+        maybe_log(self.args, f"[Inner] refinement finished | best_score={best_score:.6f}")
+        log_event(
+            self.args,
+            stage="inner_search",
+            event="end",
+            outer_gen=outer_gen,
+            inner_best_score=f"{best_score:.6f}",
+            beta=f"{best_beta:.6f}",
+            num_layers=len(vertical_specs),
+        )
+
+        self.inner_cache[vertical_specs] = (best_score, best_chromosome)
+        return best_score, best_chromosome
+
+    def _evaluate(self, x, out, *args, **kwargs):
+        vertical_specs = decode_vertical(x, self.source_models, self.args.new_model_layers)
+        algorithm = kwargs.get("algorithm", None)
+        outer_gen = getattr(algorithm, "n_gen", "")
+
+        maybe_log(
+            self.args,
+            f"[Outer] evaluating vertical candidate with {len(vertical_specs)} layers...",
+        )
+
+        log_event(
+            self.args,
+            stage="outer",
+            event="candidate_start",
+            outer_gen=outer_gen,
+            num_layers=len(vertical_specs),
+        )
+
+        inner_best_score, best_chromosome = self._search_horizontal(vertical_specs, outer_gen=outer_gen)
+
+        score, fairness = evaluate_chromosome(
+            best_chromosome,
+            self.source_models,
+            self.tokenizer,
+            self.args,
+            self.eval_cache,
+        )
+
+        maybe_log(
+            self.args,
+            f"[Outer] candidate finished | inner_best_score={inner_best_score:.6f} | score={score:.6f} | fairness={fairness:.6f}",
+        )
+
+        log_event(
+            self.args,
+            stage="outer",
+            event="candidate_end",
+            outer_gen=outer_gen,
+            score=f"{score:.6f}",
+            fairness=f"{fairness:.6f}",
+            inner_best_score=f"{inner_best_score:.6f}",
+            beta=f"{best_chromosome.beta:.6f}",
+            num_layers=len(vertical_specs),
+        )
+
+        out["F"] = np.asarray([-score, fairness], dtype=float)
